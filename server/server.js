@@ -1,4 +1,7 @@
 const auth = require("./middleware/auth");
+const leaderAuth = require("./middleware/leaderAuth");
+const cartLock = require("./middleware/cartLock");
+const { recalculateMemberTotal, validateCartInput } = require("./helpers/cartHelpers");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 console.log("LOADED UPDATED FILE");
@@ -221,35 +224,10 @@ app.post("/groups/:id/join", async (req, res) => {
         });
     }
 });
-app.post("/groups/:groupId/cart", async (req, res) => {
+app.post("/groups/:groupId/cart", [auth, cartLock], async (req, res) => {
     try {
-
-        const group = await Group.findById(req.params.groupId);
-
-        if (!group) {
-            return res.status(404).json({
-                message: "Group not found"
-            });
-        }
-
-        const member = group.members.find(
-            member => member.email === req.body.email
-        );
-
-        if (!member) {
-            return res.status(404).json({
-                message: "Member not found"
-            });
-        }
-       if (member.paymentVerified) {
-
-    return res.status(400).json({
-        message:
-            "Cart locked after payment verification"
-    });
-
-}
-
+        const group = req.group;
+        const member = req.member;
 
         const itemTotal =
             req.body.quantity * req.body.price;
@@ -268,6 +246,148 @@ app.post("/groups/:groupId/cart", async (req, res) => {
 
         res.json({
             message: "Item added successfully",
+            member
+        });
+
+    } catch (error) {
+        res.status(500).json({
+            message: error.message
+        });
+    }
+});
+app.post("/groups/:groupId/cart/add", [auth, cartLock], async (req, res) => {
+    try {
+        const group = req.group;
+        const member = req.member;
+        const { productName, productLink, quantity, price } = req.body;
+
+        // Validation using shared helper
+        const validationError = validateCartInput(req.body, {
+            requireProductName: true,
+            requireQuantity: true,
+            requirePrice: true
+        });
+        if (validationError) {
+            return res.status(400).json(validationError);
+        }
+
+        // Calculate item total
+        const itemTotal = quantity * price;
+
+        // Push item to member's cart
+        member.cartItems.push({
+            productName: productName.trim(),
+            productLink: productLink || "",
+            quantity,
+            price,
+            itemTotal
+        });
+
+        // Recalculate totalAmount from all cart items (ensures consistency)
+        recalculateMemberTotal(member);
+
+        await group.save();
+
+        res.json({
+            message: "Item added successfully",
+            member
+        });
+
+    } catch (error) {
+        res.status(500).json({
+            message: error.message
+        });
+    }
+});
+app.put("/groups/:groupId/cart/edit", [auth, cartLock], async (req, res) => {
+    try {
+        const group = req.group;
+        const member = req.member;
+        const { itemId, productName, productLink, quantity, price } = req.body;
+
+        // itemId is required to identify the item
+        if (!itemId) {
+            return res.status(400).json({
+                message: "itemId is required"
+            });
+        }
+
+        // Validate quantity/price if provided
+        const validationError = validateCartInput(req.body, {
+            requireProductName: false,
+            requireQuantity: false,
+            requirePrice: false
+        });
+        if (validationError) {
+            return res.status(400).json(validationError);
+        }
+
+        // Find item by its _id in the member's cart
+        const item = member.cartItems.id(itemId);
+
+        if (!item) {
+            return res.status(404).json({
+                message: "Item not found in cart"
+            });
+        }
+
+        // Apply updates for provided fields only
+        if (productName !== undefined) item.productName = productName.trim();
+        if (productLink !== undefined) item.productLink = productLink;
+        if (quantity !== undefined) item.quantity = quantity;
+        if (price !== undefined) item.price = price;
+
+        // Recalculate item total
+        item.itemTotal = item.quantity * item.price;
+
+        // Recalculate member total from all items
+        recalculateMemberTotal(member);
+
+        await group.save();
+
+        res.json({
+            message: "Item updated successfully",
+            member
+        });
+
+    } catch (error) {
+        res.status(500).json({
+            message: error.message
+        });
+    }
+});
+app.delete("/groups/:groupId/cart/remove", [auth, cartLock], async (req, res) => {
+    try {
+        const group = req.group;
+        const member = req.member;
+        const { itemId } = req.body;
+
+        // itemId is required to identify the item
+        if (!itemId) {
+            return res.status(400).json({
+                message: "itemId is required"
+            });
+        }
+
+        // Find item by its _id in the member's cart
+        const item = member.cartItems.id(itemId);
+
+        if (!item) {
+            return res.status(404).json({
+                message: "Item not found in cart"
+            });
+        }
+
+        // Remove the item using Mongoose pull
+        member.cartItems.pull(itemId);
+
+        // Recalculate member total from remaining items
+        recalculateMemberTotal(member);
+
+        await group.save();
+
+        res.json({
+            message: "Item removed successfully",
             member
         });
 
@@ -459,16 +579,15 @@ app.get("/groups/:groupId/shopping-list", async (req, res) => {
         });
     }
 });
-app.post("/groups/:groupId/close", async (req, res) => {
+app.post("/groups/:groupId/close", [auth, leaderAuth], async (req, res) => {
 
     try {
 
-        const group =
-            await Group.findById(req.params.groupId);
+        const group = req.group; // Already fetched by leaderAuth middleware
 
-        if (!group) {
-            return res.status(404).json({
-                message: "Group not found"
+        if (group.isClosed) {
+            return res.status(400).json({
+                message: "Group is already closed"
             });
         }
 
@@ -487,12 +606,17 @@ app.post("/groups/:groupId/close", async (req, res) => {
     }
 
 });
-app.post("/groups/:groupId/verify-payment", async (req, res) => {
+app.post("/groups/:groupId/verify-payment", [auth, leaderAuth], async (req, res) => {
 
     try {
 
-        const group =
-            await Group.findById(req.params.groupId);
+        const group = req.group; // Already fetched by leaderAuth middleware
+
+        if (!req.body.email) {
+            return res.status(400).json({
+                message: "Member email is required"
+            });
+        }
 
         const member =
             group.members.find(
@@ -520,6 +644,51 @@ app.post("/groups/:groupId/verify-payment", async (req, res) => {
             message: error.message
         });
 
+    }
+
+});
+app.put("/groups/:groupId/fees", [auth, leaderAuth], async (req, res) => {
+
+    try {
+
+        const group = req.group; // Already fetched by leaderAuth middleware
+        const { deliveryFee, handlingFee, platformFee } = req.body;
+
+        // Validate at least one fee field is present
+        if (deliveryFee === undefined && handlingFee === undefined && platformFee === undefined) {
+            return res.status(400).json({
+                message: "At least one fee field is required (deliveryFee, handlingFee, platformFee)"
+            });
+        }
+
+        // Validate each provided fee value
+        const fields = { deliveryFee, handlingFee, platformFee };
+        for (const [field, value] of Object.entries(fields)) {
+            if (value !== undefined) {
+                if (typeof value !== "number" || value < 0 || value > 99999) {
+                    return res.status(400).json({
+                        message: `Invalid value for ${field}: must be a number between 0 and 99999`
+                    });
+                }
+            }
+        }
+
+        // Apply updates only for provided fields
+        if (deliveryFee !== undefined) group.deliveryFee = deliveryFee;
+        if (handlingFee !== undefined) group.handlingFee = handlingFee;
+        if (platformFee !== undefined) group.platformFee = platformFee;
+
+        await group.save();
+
+        res.json({
+            message: "Fees updated successfully",
+            group
+        });
+
+    } catch (error) {
+        res.status(500).json({
+            message: error.message
+        });
     }
 
 });
