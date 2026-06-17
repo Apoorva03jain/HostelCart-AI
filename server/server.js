@@ -1,7 +1,7 @@
 const auth = require("./middleware/auth");
 const leaderAuth = require("./middleware/leaderAuth");
 const cartLock = require("./middleware/cartLock");
-const { recalculateMemberTotal, validateCartInput } = require("./helpers/cartHelpers");
+const { recalculateMemberTotal, validateCartInput, checkAndAutoCloseGroup } = require("./helpers/cartHelpers");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 console.log("LOADED UPDATED FILE");
@@ -244,10 +244,22 @@ app.post("/groups/:groupId/cart", [auth, cartLock], async (req, res) => {
 
         await group.save();
 
-        res.json({
-            message: "Item added successfully",
+        // Check for auto-close after cart modification
+        const { autoClosed, groupTotal } = await checkAndAutoCloseGroup(group);
+
+        const response = {
+            message: autoClosed
+                ? "Item added successfully. Target reached. Group closed automatically."
+                : "Item added successfully",
             member
-        });
+        };
+
+        if (autoClosed) {
+            response.autoClosed = true;
+            response.groupTotal = groupTotal;
+        }
+
+        res.json(response);
 
     } catch (error) {
         res.status(500).json({
@@ -288,10 +300,22 @@ app.post("/groups/:groupId/cart/add", [auth, cartLock], async (req, res) => {
 
         await group.save();
 
-        res.json({
-            message: "Item added successfully",
+        // Check for auto-close after cart modification
+        const { autoClosed, groupTotal } = await checkAndAutoCloseGroup(group);
+
+        const response = {
+            message: autoClosed
+                ? "Item added successfully. Target reached. Group closed automatically."
+                : "Item added successfully",
             member
-        });
+        };
+
+        if (autoClosed) {
+            response.autoClosed = true;
+            response.groupTotal = groupTotal;
+        }
+
+        res.json(response);
 
     } catch (error) {
         res.status(500).json({
@@ -345,10 +369,22 @@ app.put("/groups/:groupId/cart/edit", [auth, cartLock], async (req, res) => {
 
         await group.save();
 
-        res.json({
-            message: "Item updated successfully",
+        // Check for auto-close after cart modification
+        const { autoClosed, groupTotal } = await checkAndAutoCloseGroup(group);
+
+        const response = {
+            message: autoClosed
+                ? "Item updated successfully. Target reached. Group closed automatically."
+                : "Item updated successfully",
             member
-        });
+        };
+
+        if (autoClosed) {
+            response.autoClosed = true;
+            response.groupTotal = groupTotal;
+        }
+
+        res.json(response);
 
     } catch (error) {
         res.status(500).json({
@@ -386,10 +422,22 @@ app.delete("/groups/:groupId/cart/remove", [auth, cartLock], async (req, res) =>
 
         await group.save();
 
-        res.json({
+        // Note: Remove reduces total, so auto-close is unlikely but checked for consistency
+        const { autoClosed, groupTotal } = await checkAndAutoCloseGroup(group);
+
+        const response = {
             message: "Item removed successfully",
             member
-        });
+        };
+
+        // Include auto-close info if it somehow triggered (edge case with threshold = 0)
+        if (autoClosed) {
+            response.message = "Item removed successfully. Target reached. Group closed automatically.";
+            response.autoClosed = true;
+            response.groupTotal = groupTotal;
+        }
+
+        res.json(response);
 
     } catch (error) {
         res.status(500).json({
@@ -696,6 +744,14 @@ app.get("/groups/:groupId/final-shopping-list", async (req, res) => {
 
     try {
 
+        // 1. Validate ObjectId format before querying DB
+        if (!mongoose.Types.ObjectId.isValid(req.params.groupId)) {
+            return res.status(400).json({
+                message: "Invalid group identifier"
+            });
+        }
+
+        // 2. Fetch group
         const group =
             await Group.findById(req.params.groupId);
 
@@ -705,32 +761,55 @@ app.get("/groups/:groupId/final-shopping-list", async (req, res) => {
             });
         }
 
-        const shoppingList = {};
+        // 3. Group must be closed before generating final shopping list
+        if (!group.isClosed) {
+            return res.status(400).json({
+                message: "Group must be closed before generating final shopping list"
+            });
+        }
+
+        // 4. Single pass aggregation: collect products and compute totals
+        const productMap = new Map();
+        let verifiedMembers = 0;
+        let groupTotal = 0;
 
         group.members.forEach(member => {
 
-            if (!member.paymentVerified)
-                return;
+            // Only include payment-verified members
+            if (!member.paymentVerified) return;
+
+            verifiedMembers++;
+            groupTotal += member.totalAmount;
 
             member.cartItems.forEach(item => {
 
-                if (!shoppingList[item.productName]) {
+                // Normalize: trim whitespace, lowercase for deduplication key
+                const key = item.productName.trim().toLowerCase();
 
-                    shoppingList[item.productName] =
-                        item.quantity;
-
+                if (productMap.has(key)) {
+                    productMap.get(key).totalQuantity += item.quantity;
                 } else {
-
-                    shoppingList[item.productName] +=
-                        item.quantity;
-
+                    // Store first-seen display name (trimmed)
+                    productMap.set(key, {
+                        productName: item.productName.trim(),
+                        totalQuantity: item.quantity
+                    });
                 }
 
             });
 
         });
 
-        res.json(shoppingList);
+        // 5. Convert to array and sort alphabetically (case-insensitive)
+        const shoppingList = Array.from(productMap.values()).sort(
+            (a, b) => a.productName.toLowerCase().localeCompare(b.productName.toLowerCase())
+        );
+
+        res.json({
+            shoppingList,
+            verifiedMembers,
+            groupTotal
+        });
 
     } catch (error) {
 
