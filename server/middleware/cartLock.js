@@ -56,6 +56,13 @@ const cartLock = async (req, res, next) => {
             });
         }
 
+        // 5.5 Block if group is closed (TARGET mode auto-closed or manually closed)
+        if (group.isClosed) {
+            return res.status(403).json({
+                message: "Group is closed. Cart modifications are not allowed."
+            });
+        }
+
         // 6. Check lock condition — block if payment already verified
         if (member.paymentVerified === true) {
             return res.status(403).json({

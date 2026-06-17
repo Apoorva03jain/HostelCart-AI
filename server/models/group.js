@@ -11,6 +11,11 @@ const groupSchema = new mongoose.Schema({
         required: true
     },
 
+    leaderName: {
+        type: String,
+        default: ""
+    },
+
     hostelName: {
         type: String,
         required: true
@@ -51,9 +56,24 @@ isClosed: {
     default: false
 },
 
+closedAt: {
+    type: Date,
+    default: null
+},
+
     status: {
         type: String,
         default: "ACTIVE"
+    },
+
+    paymentQR: {
+        type: String,
+        default: ""
+    },
+
+    leaderUpiId: {
+        type: String,
+        default: ""
     },
 
     members: [

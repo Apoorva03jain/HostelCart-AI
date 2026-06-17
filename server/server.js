@@ -1,12 +1,13 @@
+require("dotenv").config();
 const auth = require("./middleware/auth");
 const leaderAuth = require("./middleware/leaderAuth");
 const cartLock = require("./middleware/cartLock");
-const { recalculateMemberTotal, validateCartInput, checkAndAutoCloseGroup } = require("./helpers/cartHelpers");
+const { recalculateMemberTotal, validateCartInput, checkTimeBasedClosure } = require("./helpers/cartHelpers");
 const socketEvents = require("./helpers/socketEvents");
+const { startCleanupScheduler } = require("./helpers/groupCleanup");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 console.log("LOADED UPDATED FILE");
-require("dotenv").config();
 const mongoose = require("mongoose");
 const User = require("./models/User");
 const Group = require("./models/Group");
@@ -205,9 +206,41 @@ app.post("/login", async (req, res) => {
     }
 
 });
-app.post("/groups", async (req, res) => {
+app.post("/groups", [auth], async (req, res) => {
     try {
-        const group = await Group.create(req.body);
+        // Validate UPI ID
+        if (!req.body.leaderUpiId || req.body.leaderUpiId.trim().length < 3) {
+            return res.status(400).json({
+                message: "Valid UPI ID is required (e.g. user@paytm)"
+            });
+        }
+
+        // Create group with leader as first member
+        const groupData = {
+            storeName: req.body.storeName,
+            groupLeader: req.user.email,
+            leaderName: req.body.leaderName || req.user.email.split("@")[0],
+            hostelName: req.body.hostelName,
+            closingTime: req.body.closingTime,
+            deliveryThreshold: Number(req.body.deliveryThreshold) || 199,
+            deliveryFee: Number(req.body.deliveryFee) || 40,
+            handlingFee: Number(req.body.handlingFee) || 0,
+            platformFee: Number(req.body.platformFee) || 0,
+            closeMode: req.body.closeMode || "TIME",
+            leaderUpiId: req.body.leaderUpiId.trim(),
+            members: [
+                {
+                    name: req.body.leaderName || req.user.email.split("@")[0],
+                    email: req.user.email,
+                    paid: false,
+                    paymentVerified: false,
+                    totalAmount: 0,
+                    cartItems: [],
+                }
+            ],
+        };
+
+        const group = await Group.create(groupData);
 
         res.status(201).json({
             message: "Group created successfully",
@@ -240,6 +273,22 @@ app.post("/groups/:id/join", async (req, res) => {
         if (!group) {
             return res.status(404).json({
                 message: "Group not found"
+            });
+        }
+
+        if (group.isClosed) {
+            return res.status(400).json({
+                message: "Group is closed"
+            });
+        }
+
+        // Prevent duplicate membership
+        const alreadyMember = group.members.some(
+            m => m.email.toLowerCase() === req.body.email.toLowerCase()
+        );
+        if (alreadyMember) {
+            return res.status(400).json({
+                message: "Already a member"
             });
         }
 
@@ -287,25 +336,12 @@ app.post("/groups/:groupId/cart", [auth, cartLock], async (req, res) => {
 
         await group.save();
 
-        // Check for auto-close after cart modification
-        const { autoClosed, groupTotal } = await checkAndAutoCloseGroup(group);
-
-        const response = {
-            message: autoClosed
-                ? "Item added successfully. Target reached. Group closed automatically."
-                : "Item added successfully",
-            member
-        };
-
-        if (autoClosed) {
-            response.autoClosed = true;
-            response.groupTotal = groupTotal;
-            socketEvents.emitGroupClosed(req.params.groupId, { groupTotal });
-        }
-
         socketEvents.emitCartItemAdded(req.params.groupId, { memberEmail: member.email, productName: req.body.productName });
 
-        res.json(response);
+        res.json({
+            message: "Item added successfully",
+            member
+        });
 
     } catch (error) {
         res.status(500).json({
@@ -346,25 +382,12 @@ app.post("/groups/:groupId/cart/add", [auth, cartLock], async (req, res) => {
 
         await group.save();
 
-        // Check for auto-close after cart modification
-        const { autoClosed, groupTotal } = await checkAndAutoCloseGroup(group);
-
-        const response = {
-            message: autoClosed
-                ? "Item added successfully. Target reached. Group closed automatically."
-                : "Item added successfully",
-            member
-        };
-
-        if (autoClosed) {
-            response.autoClosed = true;
-            response.groupTotal = groupTotal;
-            socketEvents.emitGroupClosed(req.params.groupId, { groupTotal });
-        }
-
         socketEvents.emitCartItemAdded(req.params.groupId, { memberEmail: member.email, productName: productName.trim() });
 
-        res.json(response);
+        res.json({
+            message: "Item added successfully",
+            member
+        });
 
     } catch (error) {
         res.status(500).json({
@@ -418,25 +441,12 @@ app.put("/groups/:groupId/cart/edit", [auth, cartLock], async (req, res) => {
 
         await group.save();
 
-        // Check for auto-close after cart modification
-        const { autoClosed, groupTotal } = await checkAndAutoCloseGroup(group);
-
-        const response = {
-            message: autoClosed
-                ? "Item updated successfully. Target reached. Group closed automatically."
-                : "Item updated successfully",
-            member
-        };
-
-        if (autoClosed) {
-            response.autoClosed = true;
-            response.groupTotal = groupTotal;
-            socketEvents.emitGroupClosed(req.params.groupId, { groupTotal });
-        }
-
         socketEvents.emitCartItemUpdated(req.params.groupId, { memberEmail: member.email, itemId });
 
-        res.json(response);
+        res.json({
+            message: "Item updated successfully",
+            member
+        });
 
     } catch (error) {
         res.status(500).json({
@@ -474,25 +484,12 @@ app.delete("/groups/:groupId/cart/remove", [auth, cartLock], async (req, res) =>
 
         await group.save();
 
-        // Note: Remove reduces total, so auto-close is unlikely but checked for consistency
-        const { autoClosed, groupTotal } = await checkAndAutoCloseGroup(group);
-
-        const response = {
-            message: "Item removed successfully",
-            member
-        };
-
-        // Include auto-close info if it somehow triggered (edge case with threshold = 0)
-        if (autoClosed) {
-            response.message = "Item removed successfully. Target reached. Group closed automatically.";
-            response.autoClosed = true;
-            response.groupTotal = groupTotal;
-            socketEvents.emitGroupClosed(req.params.groupId, { groupTotal });
-        }
-
         socketEvents.emitCartItemRemoved(req.params.groupId, { memberEmail: member.email, itemId });
 
-        res.json(response);
+        res.json({
+            message: "Item removed successfully",
+            member
+        });
 
     } catch (error) {
         res.status(500).json({
@@ -525,15 +522,6 @@ app.get("/groups/:groupId/summary", async (req, res) => {
 
         const freeDeliveryAchieved =
             groupTotal >= group.deliveryThreshold;
-
-        if (
-            group.closeMode === "TARGET" &&
-            freeDeliveryAchieved &&
-            !group.isClosed
-        ) {
-            group.isClosed = true;
-            await group.save();
-        }
 
         res.json({
             storeName: group.storeName,
@@ -626,9 +614,24 @@ app.post("/groups/:groupId/pay", async (req, res) => {
 
         const group = await Group.findById(req.params.groupId);
 
+        if (!group) {
+            return res.status(404).json({
+                message: "Group not found"
+            });
+        }
+
+        const payerEmail = (req.body.email || "").trim().toLowerCase();
+
+        console.log("💰 PAY REQUEST", {
+            target: req.body.email,
+            normalized: payerEmail,
+            groupLeader: group.groupLeader,
+            memberEmails: group.members.map(m => m.email)
+        });
+
         const member =
             group.members.find(
-                m => m.email === req.body.email
+                m => m.email.toLowerCase() === payerEmail
             );
 
         if (!member) {
@@ -639,15 +642,41 @@ app.post("/groups/:groupId/pay", async (req, res) => {
 
         member.paid = true;
 
+        // Auto-verify if the payer is the group leader
+        const isLeader = payerEmail === group.groupLeader.trim().toLowerCase();
+
+        console.log("💰 IS LEADER?", { isLeader, payerEmail, groupLeader: group.groupLeader.trim().toLowerCase() });
+
+        if (isLeader) {
+            member.paymentVerified = true;
+        }
+
+        console.log("💰 MEMBER BEFORE SAVE:", { paid: member.paid, paymentVerified: member.paymentVerified });
+
         await group.save();
 
+        // Verify save worked
+        const savedGroup = await Group.findById(req.params.groupId);
+        const savedMember = savedGroup.members.find(m => m.email.toLowerCase() === payerEmail);
+        console.log("💰 MEMBER AFTER SAVE:", { paid: savedMember.paid, paymentVerified: savedMember.paymentVerified });
+
+        // Emit payment-submitted event
         socketEvents.emitPaymentSubmitted(req.params.groupId, { email: req.body.email });
 
+        // If leader, also emit payment-verified (auto-verification)
+        if (isLeader) {
+            socketEvents.emitPaymentVerified(req.params.groupId, { email: req.body.email });
+        }
+
         res.json({
-            message: "Payment marked successfully"
+            message: isLeader
+                ? "Payment marked and auto-verified (leader)"
+                : "Payment marked successfully",
+            autoVerified: isLeader
         });
 
     } catch (error) {
+        console.error("❌ PAY ERROR:", error.message);
         res.status(500).json({
             message: error.message
         });
@@ -697,6 +726,7 @@ app.post("/groups/:groupId/close", [auth, leaderAuth], async (req, res) => {
         }
 
         group.isClosed = true;
+        group.closedAt = new Date();
 
         await group.save();
 
@@ -725,6 +755,13 @@ app.post("/groups/:groupId/verify-payment", [auth, leaderAuth], async (req, res)
             });
         }
 
+        // Prevent leader from verifying own payment
+        if (req.body.email.toLowerCase() === req.user.email.toLowerCase()) {
+            return res.status(400).json({
+                message: "Leader cannot verify their own payment"
+            });
+        }
+
         const member =
             group.members.find(
                 m => m.email === req.body.email
@@ -741,10 +778,31 @@ app.post("/groups/:groupId/verify-payment", [auth, leaderAuth], async (req, res)
 
         await group.save();
 
+        // Calculate verified total for threshold check
+        const verifiedTotal = group.members
+            .filter(m => m.paymentVerified === true)
+            .reduce((sum, m) => sum + m.totalAmount, 0);
+
+        const thresholdReached = verifiedTotal >= group.deliveryThreshold;
+        const pendingMembers = group.members.filter(m => !m.paymentVerified);
+
         socketEvents.emitPaymentVerified(req.params.groupId, { email: req.body.email });
 
+        // If threshold reached, emit event for leader modal
+        if (thresholdReached) {
+            socketEvents.emitToGroup(req.params.groupId, "threshold-reached", {
+                verifiedTotal,
+                threshold: group.deliveryThreshold,
+                pendingCount: pendingMembers.length,
+                pendingAmount: pendingMembers.reduce((s, m) => s + m.totalAmount, 0),
+            });
+        }
+
         res.json({
-            message: "Payment verified"
+            message: "Payment verified",
+            verifiedTotal,
+            thresholdReached,
+            pendingCount: pendingMembers.length,
         });
 
     } catch (error) {
@@ -806,6 +864,34 @@ app.put("/groups/:groupId/fees", [auth, leaderAuth], async (req, res) => {
         });
     }
 
+});
+app.put("/groups/:groupId/payment-details", [auth, leaderAuth], async (req, res) => {
+    try {
+        const group = req.group;
+
+        if (!req.body.leaderUpiId || req.body.leaderUpiId.trim().length < 3) {
+            return res.status(400).json({
+                message: "Valid UPI ID is required"
+            });
+        }
+
+        group.leaderUpiId = req.body.leaderUpiId.trim();
+        await group.save();
+
+        socketEvents.emitToGroup(req.params.groupId, "payment-details-updated", {
+            leaderUpiId: group.leaderUpiId,
+        });
+
+        res.json({
+            message: "Payment details updated successfully",
+            leaderUpiId: group.leaderUpiId,
+        });
+
+    } catch (error) {
+        res.status(500).json({
+            message: error.message
+        });
+    }
 });
 app.get("/groups/:groupId/final-shopping-list", async (req, res) => {
 
@@ -911,6 +997,7 @@ mongoose
   .connect(process.env.MONGODB_URI)
   .then(() => {
     console.log("✅ MongoDB Connected");
+    startCleanupScheduler();
   })
   .catch((error) => {
     console.log("❌ MongoDB Error:", error);

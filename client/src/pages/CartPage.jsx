@@ -8,7 +8,13 @@ import { Input } from "../components/shared/Input";
 import { Alert } from "../components/shared/Alert";
 import { Spinner } from "../components/shared/Spinner";
 import { Badge } from "../components/shared/Badge";
+import { Modal } from "../components/shared/Modal";
 import { ToastContainer } from "../components/shared/Toast";
+import { EmptyState } from "../components/shared/EmptyState";
+import { SuggestionPanel } from "../components/features/ai/SuggestionPanel";
+import { ThresholdSuggestions } from "../components/features/ai/ThresholdSuggestions";
+import { OrderTemplates } from "../components/features/ai/OrderTemplates";
+import { SavingsBanner } from "../components/features/ai/SavingsBanner";
 import { formatCurrency } from "../utils/formatters";
 import api from "../services/api";
 
@@ -25,6 +31,7 @@ export function CartPage() {
   const [form, setForm] = useState({ productName: "", productLink: "", quantity: "", price: "" });
   const [editingItem, setEditingItem] = useState(null);
   const [editForm, setEditForm] = useState({ quantity: "", price: "" });
+  const [showPayModal, setShowPayModal] = useState(false);
 
   useEffect(() => { fetchCart(); }, [id]);
 
@@ -43,6 +50,7 @@ export function CartPage() {
     on("cart-item-added", () => fetchCart());
     on("cart-item-updated", () => fetchCart());
     on("cart-item-removed", () => fetchCart());
+    on("payment-details-updated", () => fetchCart());
   }, [on, addToast, user]);
 
   const fetchCart = async () => {
@@ -127,6 +135,39 @@ export function CartPage() {
     }
   };
 
+  const handleAddAISuggestion = async (item) => {
+    setError(""); setSuccess("");
+    try {
+      const { data } = await api.post(`/groups/${id}/cart/add`, {
+        productName: item.productName,
+        quantity: 1,
+        price: item.price,
+      });
+      setMember(data.member);
+      setSuccess(`Added ${item.productName} to cart`);
+      fetchCart();
+    } catch (err) {
+      setError(err.response?.data?.message || "Failed to add item");
+    }
+  };
+
+  const handleApplyTemplate = async (items) => {
+    setError(""); setSuccess("");
+    try {
+      for (const item of items) {
+        await api.post(`/groups/${id}/cart/add`, {
+          productName: item.productName,
+          quantity: item.quantity,
+          price: item.price,
+        });
+      }
+      setSuccess(`Template applied! ${items.length} items added.`);
+      fetchCart();
+    } catch (err) {
+      setError(err.response?.data?.message || "Failed to apply template");
+    }
+  };
+
   if (loading) return <div className="py-12"><Spinner size="lg" /></div>;
 
   return (
@@ -135,7 +176,19 @@ export function CartPage() {
       <h1 className="text-2xl font-bold text-gray-900">My Cart</h1>
 
       {isLocked && (
-        <Alert type="warning" message="Your cart is locked — payment has been verified or group is closed." />
+        <div className="bg-amber-50 border border-amber-200 rounded-lg p-4">
+          <div className="flex items-start gap-3">
+            <span className="text-xl">🔒</span>
+            <div>
+              <p className="font-medium text-amber-900 text-sm">Cart Locked</p>
+              <p className="text-xs text-amber-700 mt-1">
+                {member?.paymentVerified
+                  ? "Your payment has been verified by the group leader. Cart modifications are no longer allowed."
+                  : "The group has been closed. No further modifications are allowed."}
+              </p>
+            </div>
+          </div>
+        </div>
       )}
       <Alert type="error" message={error} onClose={() => setError("")} />
       <Alert type="success" message={success} onClose={() => setSuccess("")} />
@@ -156,9 +209,13 @@ export function CartPage() {
       )}
 
       {/* Cart Items */}
-      <Card title="Cart Items">
+      <Card title={`Cart Items${member?.cartItems?.length ? ` (${member.cartItems.length})` : ""}`}>
         {!member || member.cartItems.length === 0 ? (
-          <p className="text-gray-500 text-sm">No items in cart yet.</p>
+          <EmptyState
+            icon="🛒"
+            title="No items in cart"
+            description={isLocked ? "Your cart is locked." : "Add products to start building your order."}
+          />
         ) : (
           <div className="space-y-3">
             {member.cartItems.map((item) => (
@@ -196,13 +253,89 @@ export function CartPage() {
           <span className="text-lg font-bold text-indigo-600">{formatCurrency(member?.totalAmount || 0)}</span>
         </div>
         {member && !member.paid && !isLocked && (
-          <Button variant="secondary" className="w-full mt-4" onClick={handlePay}>
+          <Button variant="secondary" className="w-full mt-4" onClick={() => {
+            if (group?.leaderUpiId) {
+              setShowPayModal(true);
+            } else {
+              handlePay();
+            }
+          }}>
             Mark as Paid
           </Button>
+        )}
+        {member && !member.paid && !isLocked && !group?.leaderUpiId && (
+          <p className="text-xs text-amber-600 mt-2">⚠️ Leader has not configured payment details</p>
         )}
         {member?.paid && <Badge variant="success">Payment Marked</Badge>}
         {member?.paymentVerified && <Badge variant="info">Verified by Leader</Badge>}
       </Card>
+
+      {/* Payment Modal */}
+      <Modal isOpen={showPayModal} onClose={() => setShowPayModal(false)} title="Send Payment to Group Leader">
+        <div className="text-center">
+          <p className="text-sm text-gray-500 mb-2">Transfer to</p>
+          <p className="text-lg font-bold text-gray-900 mb-1">{group?.leaderName || group?.groupLeader?.split("@")[0]}</p>
+          {group?.leaderUpiId ? (
+            <div className="bg-gray-50 rounded-lg px-4 py-3 mb-4">
+              <p className="font-mono text-indigo-700 font-medium text-lg">{group.leaderUpiId}</p>
+              <button
+                onClick={() => navigator.clipboard.writeText(group.leaderUpiId)}
+                className="mt-2 text-xs bg-indigo-100 text-indigo-700 px-3 py-1 rounded hover:bg-indigo-200 transition"
+              >
+                📋 Copy UPI ID
+              </button>
+            </div>
+          ) : (
+            <p className="text-amber-600 text-sm mb-4">⚠️ Leader has not set UPI ID</p>
+          )}
+          <p className="text-sm text-gray-700 mb-1">Amount Due:</p>
+          <p className="text-2xl font-bold text-indigo-600 mb-4">{formatCurrency(member?.totalAmount || 0)}</p>
+          {group?.leaderUpiId && (
+            <a
+              href={`upi://pay?pa=${encodeURIComponent(group.leaderUpiId)}&pn=${encodeURIComponent(group.leaderName || "Leader")}&am=${member?.totalAmount || 0}&cu=INR`}
+              className="inline-block mb-4 text-sm bg-green-50 text-green-700 px-4 py-2 rounded-lg hover:bg-green-100 transition"
+            >
+              📱 Pay via UPI App
+            </a>
+          )}
+          <p className="text-xs text-gray-500 mb-4">Transfer the amount and then confirm below.</p>
+          <Button className="w-full" onClick={() => { setShowPayModal(false); handlePay(); }}>
+            I've Paid
+          </Button>
+        </div>
+      </Modal>
+
+      {/* AI Savings Banner */}
+      {group && !isLocked && (
+        <SavingsBanner group={group} summary={{ freeDeliveryAchieved: group.isClosed, remainingForFreeDelivery: Math.max(0, group.deliveryThreshold - (group.members?.reduce((s, m) => s + m.totalAmount, 0) || 0)) }} />
+      )}
+
+      {/* AI Suggestions */}
+      {!isLocked && member?.cartItems?.length > 0 && (
+        <SuggestionPanel
+          cartItems={member.cartItems}
+          onAddItem={(item) => handleAddAISuggestion(item)}
+          disabled={isLocked}
+        />
+      )}
+
+      {/* Threshold Recommendations */}
+      {!isLocked && group && (
+        <ThresholdSuggestions
+          remaining={Math.max(0, group.deliveryThreshold - (group.members?.reduce((s, m) => s + m.totalAmount, 0) || 0))}
+          cartItems={member?.cartItems || []}
+          onAddItem={(item) => handleAddAISuggestion(item)}
+          disabled={isLocked}
+        />
+      )}
+
+      {/* Order Templates */}
+      {!isLocked && (
+        <OrderTemplates
+          onApplyTemplate={handleApplyTemplate}
+          disabled={isLocked}
+        />
+      )}
     </div>
   );
 }

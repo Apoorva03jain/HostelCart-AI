@@ -19,6 +19,7 @@ export function CreateGroupPage() {
     handlingFee: "0",
     platformFee: "0",
     closeMode: "TIME",
+    leaderUpiId: "",
   });
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
@@ -30,11 +31,17 @@ export function CreateGroupPage() {
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError("");
+
+    if (!form.leaderUpiId.trim() || form.leaderUpiId.trim().length < 3) {
+      setError("Please enter a valid UPI ID (e.g. yourname@paytm)");
+      return;
+    }
+
     setLoading(true);
     try {
       const payload = {
         storeName: form.storeName,
-        groupLeader: user.email,
+        leaderName: user.name,
         hostelName: form.hostelName,
         closingTime: new Date(form.closingTime).toISOString(),
         deliveryThreshold: Number(form.deliveryThreshold),
@@ -42,7 +49,9 @@ export function CreateGroupPage() {
         handlingFee: Number(form.handlingFee),
         platformFee: Number(form.platformFee),
         closeMode: form.closeMode,
+        leaderUpiId: form.leaderUpiId.trim(),
       };
+
       const { data } = await api.post("/groups", payload);
       navigate(`/groups/${data.group._id}`);
     } catch (err) {
@@ -76,6 +85,15 @@ export function CreateGroupPage() {
               <option value="TARGET">Target-based (auto-close on threshold)</option>
             </select>
           </div>
+          <Input
+            label="Your UPI ID"
+            name="leaderUpiId"
+            value={form.leaderUpiId}
+            onChange={handleChange}
+            placeholder="e.g. yourname@paytm"
+            required
+          />
+          <p className="text-xs text-gray-500 -mt-3 mb-4">Members will transfer payment to this UPI ID.</p>
           <Button type="submit" loading={loading} className="w-full">
             Create Group
           </Button>

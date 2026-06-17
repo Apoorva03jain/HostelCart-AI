@@ -67,43 +67,30 @@ const validateCartInput = (body, options = {}) => {
 };
 
 /**
- * Checks if a group should be auto-closed based on its closeMode and delivery threshold.
- *
- * If closeMode === "TARGET_REACHED" and the group total meets or exceeds
- * the delivery threshold, the group is automatically closed.
- *
- * This function DOES save the group if auto-close occurs.
+/**
+ * Checks if a TIME-mode group should be closed based on closingTime.
+ * Only used by the cleanup scheduler for TIME-mode groups past their closing time.
  *
  * @param {Object} group - The Mongoose group document
- * @returns {Object} - { autoClosed: Boolean, groupTotal: Number }
+ * @returns {Object} - { autoClosed: Boolean }
  */
-const checkAndAutoCloseGroup = async (group) => {
-    // Calculate current group total from all members
-    const groupTotal = group.members.reduce(
-        (sum, member) => sum + member.totalAmount, 0
-    );
-
-    // Only auto-close if:
-    // 1. closeMode is TARGET (threshold-based auto-close)
-    // 2. Group is not already closed
-    // 3. Threshold is a valid positive number
-    // 4. groupTotal meets or exceeds threshold
+const checkTimeBasedClosure = async (group) => {
     if (
-        group.closeMode === "TARGET" &&
+        group.closeMode === "TIME" &&
         !group.isClosed &&
-        group.deliveryThreshold > 0 &&
-        groupTotal >= group.deliveryThreshold
+        group.closingTime &&
+        new Date() >= new Date(group.closingTime)
     ) {
         group.isClosed = true;
+        group.closedAt = new Date();
         await group.save();
-        return { autoClosed: true, groupTotal };
+        return { autoClosed: true };
     }
-
-    return { autoClosed: false, groupTotal };
+    return { autoClosed: false };
 };
 
 module.exports = {
     recalculateMemberTotal,
     validateCartInput,
-    checkAndAutoCloseGroup
+    checkTimeBasedClosure
 };
