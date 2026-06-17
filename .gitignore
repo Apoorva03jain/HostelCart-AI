@@ -15,3 +15,4 @@ client/dist/
 
 # Vite cache
 node_modules/.vite/
+.kiro/
