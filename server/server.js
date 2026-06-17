@@ -10,7 +10,7 @@ const jwt = require("jsonwebtoken");
 console.log("LOADED UPDATED FILE");
 const mongoose = require("mongoose");
 const User = require("./models/User");
-const Group = require("./models/Group");
+const Group = require("./models/group");
 const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
