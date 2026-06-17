@@ -2,6 +2,7 @@ const auth = require("./middleware/auth");
 const leaderAuth = require("./middleware/leaderAuth");
 const cartLock = require("./middleware/cartLock");
 const { recalculateMemberTotal, validateCartInput, checkAndAutoCloseGroup } = require("./helpers/cartHelpers");
+const socketEvents = require("./helpers/socketEvents");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 console.log("LOADED UPDATED FILE");
@@ -10,9 +11,45 @@ const mongoose = require("mongoose");
 const User = require("./models/User");
 const Group = require("./models/Group");
 const express = require("express");
+const http = require("http");
+const { Server } = require("socket.io");
+const cors = require("cors");
 
 const app = express();
+app.use(cors());
 app.use(express.json());
+
+// Create HTTP server and attach Socket.IO
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST", "PUT", "DELETE"],
+  },
+});
+
+// Socket.IO connection handling
+socketEvents.setIO(io);
+
+io.on("connection", (socket) => {
+  console.log("🔌 Client connected:", socket.id);
+
+  // Join a group room
+  socket.on("join-group", (groupId) => {
+    socket.join(groupId);
+    console.log(`Socket ${socket.id} joined room: ${groupId}`);
+  });
+
+  // Leave a group room
+  socket.on("leave-group", (groupId) => {
+    socket.leave(groupId);
+    console.log(`Socket ${socket.id} left room: ${groupId}`);
+  });
+
+  socket.on("disconnect", () => {
+    console.log("🔌 Client disconnected:", socket.id);
+  });
+});
 
 const PORT = 5000;
 
@@ -213,6 +250,12 @@ app.post("/groups/:id/join", async (req, res) => {
 
         await group.save();
 
+        // Emit real-time event
+        socketEvents.emitMemberJoined(req.params.id, {
+            name: req.body.name,
+            email: req.body.email,
+        });
+
         res.json({
             message: "Joined group successfully",
             group
@@ -257,7 +300,10 @@ app.post("/groups/:groupId/cart", [auth, cartLock], async (req, res) => {
         if (autoClosed) {
             response.autoClosed = true;
             response.groupTotal = groupTotal;
+            socketEvents.emitGroupClosed(req.params.groupId, { groupTotal });
         }
+
+        socketEvents.emitCartItemAdded(req.params.groupId, { memberEmail: member.email, productName: req.body.productName });
 
         res.json(response);
 
@@ -313,7 +359,10 @@ app.post("/groups/:groupId/cart/add", [auth, cartLock], async (req, res) => {
         if (autoClosed) {
             response.autoClosed = true;
             response.groupTotal = groupTotal;
+            socketEvents.emitGroupClosed(req.params.groupId, { groupTotal });
         }
+
+        socketEvents.emitCartItemAdded(req.params.groupId, { memberEmail: member.email, productName: productName.trim() });
 
         res.json(response);
 
@@ -382,7 +431,10 @@ app.put("/groups/:groupId/cart/edit", [auth, cartLock], async (req, res) => {
         if (autoClosed) {
             response.autoClosed = true;
             response.groupTotal = groupTotal;
+            socketEvents.emitGroupClosed(req.params.groupId, { groupTotal });
         }
+
+        socketEvents.emitCartItemUpdated(req.params.groupId, { memberEmail: member.email, itemId });
 
         res.json(response);
 
@@ -435,7 +487,10 @@ app.delete("/groups/:groupId/cart/remove", [auth, cartLock], async (req, res) =>
             response.message = "Item removed successfully. Target reached. Group closed automatically.";
             response.autoClosed = true;
             response.groupTotal = groupTotal;
+            socketEvents.emitGroupClosed(req.params.groupId, { groupTotal });
         }
+
+        socketEvents.emitCartItemRemoved(req.params.groupId, { memberEmail: member.email, itemId });
 
         res.json(response);
 
@@ -586,6 +641,8 @@ app.post("/groups/:groupId/pay", async (req, res) => {
 
         await group.save();
 
+        socketEvents.emitPaymentSubmitted(req.params.groupId, { email: req.body.email });
+
         res.json({
             message: "Payment marked successfully"
         });
@@ -643,6 +700,8 @@ app.post("/groups/:groupId/close", [auth, leaderAuth], async (req, res) => {
 
         await group.save();
 
+        socketEvents.emitGroupClosed(req.params.groupId, { closedBy: "leader" });
+
         res.json({
             message: "Group closed successfully"
         });
@@ -681,6 +740,8 @@ app.post("/groups/:groupId/verify-payment", [auth, leaderAuth], async (req, res)
         member.paid = true;
 
         await group.save();
+
+        socketEvents.emitPaymentVerified(req.params.groupId, { email: req.body.email });
 
         res.json({
             message: "Payment verified"
@@ -727,6 +788,12 @@ app.put("/groups/:groupId/fees", [auth, leaderAuth], async (req, res) => {
         if (platformFee !== undefined) group.platformFee = platformFee;
 
         await group.save();
+
+        socketEvents.emitFeesUpdated(req.params.groupId, {
+            deliveryFee: group.deliveryFee,
+            handlingFee: group.handlingFee,
+            platformFee: group.platformFee,
+        });
 
         res.json({
             message: "Fees updated successfully",
@@ -849,6 +916,6 @@ mongoose
     console.log("❌ MongoDB Error:", error);
   });
 
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
